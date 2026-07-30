@@ -10,8 +10,8 @@ substitutions:
   hidden_ssid: "false"
   name: kidsroom--satellight-redstone
   friendly_name: "KidsRoom - SatelLight (Redstone)"
-  ota_password: "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-  key_encryption: "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+  ota_password: "XXXXXX"
+  key_encryption: "XXXXXX"
   ledpin: GPIO48
 
 esphome:
@@ -42,7 +42,6 @@ esp32:
   flash_size: 16MB
   framework:
     type: esp-idf
-    version: recommended
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
@@ -123,29 +122,40 @@ wifi:
     - script.execute:
         id: play_sound
         priority: true
-        sound_file: !lambda return id(wake_word_triggered_sound);
+        sound_file: "wake_word_triggered_sound"
   on_disconnect:
     - script.execute: control_leds
+  manual_ip:
+    static_ip: 192.168.2.33
+    gateway: 192.168.2.1
+    subnet: 255.255.255.0
 
 captive_portal:
 
 improv_serial:
 
 uart:
-  id: uart_id
-  tx_pin: GPIO1
-  rx_pin: GPIO3
-  baud_rate: 115200
-  parity: NONE
-  stop_bits: 1
-
+  - rx_pin: GPIO14
+    baud_rate: 9600
+    id: dummy_uart
+  - id: ld2420_uart
+    tx_pin: GPIO1
+    rx_pin: GPIO3
+    baud_rate: 115200
+    parity: NONE
+    stop_bits: 1
+  
 ld2420:
+  uart_id: ld2420_uart
 
 i2c:
   - id: air_quality
     sda: GPIO10
     scl: GPIO12
 
+sendspin:
+  task_stack_in_psram: true
+    
 i2s_audio:
   - id: i2s_input
     i2s_bclk_pin: GPIO4 #SCK
@@ -171,7 +181,7 @@ speaker:
     id: i2s_audio_speaker
     i2s_audio_id: i2s_output
     dac_type: external
-    i2s_dout_pin:
+    i2s_dout_pin:   
       number: GPIO17
     sample_rate: 48000
     buffer_duration: 100ms
@@ -195,36 +205,44 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 16
 
+media_source:
+  - platform: audio_file
+    id: file_source_media
+  - platform: audio_file
+    id: file_source_announcement
+  - platform: audio_http
+    id: http_source_media
+  - platform: audio_http
+    id: http_source_announcement
+  - platform: sendspin
+    id: sendspin_source
+
 media_player:
-  - platform: speaker
+  - platform: speaker_source
     id: external_media_player
     name: None
     internal: False
     volume_min: 0.4
     volume_max: 0.95
     volume_increment: 0.15
-    announcement_pipeline:
-      speaker: announcement_resampling_speaker
-      format: FLAC
-      num_channels: 1
-      sample_rate: 48000
     media_pipeline:
       speaker: media_resampling_speaker
-      format: FLAC
       num_channels: 2
-      sample_rate: 48000
+      sources:
+        - sendspin_source
+        - http_source_media
+        - file_source_media
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      num_channels: 1
+      sources:
+        - http_source_announcement
+        - file_source_announcement
     on_announcement:
       - mixer_speaker.apply_ducking:
           id: media_mixing_input
           decibel_reduction: 20
-          duration: 0.0s
-    on_volume:
-      then:
-        - light.turn_on:
-            id: led_internal
-            effect: "Volume Level Display"
-        - delay: 1s
-        - script.execute: sync_ceiling_to_main
+          duration: 0.0s 
     on_state:
       if:
         condition:
@@ -237,12 +255,13 @@ media_player:
           - mixer_speaker.apply_ducking:
               id: media_mixing_input
               decibel_reduction: 0
-              duration: 1.0s
-    files:
-      - id: wake_word_triggered_sound
-        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
-      - id: error_cloud_expired
-        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
+              duration: 1.0s  
+
+audio_file:
+  - id: wake_word_triggered_sound
+    file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+  - id: error_cloud_expired
+    file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
 
 light:
   - platform: esp32_rmt_led_strip
@@ -496,9 +515,12 @@ script:
           );
           call.set_brightness(main_state.get_brightness());
           
-          // Sync Effect
-          // This gets the string name of the current effect (e.g., "Rainbow")
-          call.set_effect(id(led_main).get_effect_name());
+          // If the main light has no effect, explicitly clear the VA pulsing effects
+          if (!id(led_main).get_effect_name().empty()) {
+            call.set_effect((std::string)id(led_main).get_effect_name());
+          } else {
+            call.set_effect("None"); 
+          }
           
           call.perform();
   - id: continue_conversation_restart
@@ -669,7 +691,7 @@ script:
   - id: play_sound
     parameters:
       priority: bool
-      sound_file: "audio::AudioFile*"
+      sound_file: std::string
     then:
       - lambda: |-
           if (priority) {
@@ -681,7 +703,10 @@ script:
           }
           if ( (id(external_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING ) || priority) {
             id(external_media_player)
-              ->play_file(sound_file, true, false);
+              ->make_call()
+              .set_media_url("audio-file://" + sound_file)
+              .set_announcement(true)
+              .perform();
           }
 
   - id: activate_stop_word_once
@@ -768,12 +793,16 @@ micro_wake_word:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
       # probability_cutoff: 0.8
       id: okay_nabu
-    - model: https://raw.githubusercontent.com/formatBCE/Respeaker-Lite-ESPHome-integration/refs/heads/main/microwakeword/models/v2/kenobi.json
-      id: kenobi
-    - model: https://raw.githubusercontent.com/rgnyldz/r2d2/refs/heads/main/wakeword/r2d2.json
-      id: r2d2
-    - model: https://raw.githubusercontent.com/rgnyldz/r2d2/refs/heads/main/wakeword/r2.json
-      id: r2
+    # - model: https://raw.githubusercontent.com/formatBCE/Respeaker-Lite-ESPHome-integration/refs/heads/main/microwakeword/models/v2/kenobi.json
+    #   id: kenobi
+    - model: https://raw.githubusercontent.com/rgnyldz/rgnlabs-micro-wake-words/refs/heads/main/artemis/artamis.json
+      id: artemis
+    # - model: https://raw.githubusercontent.com/rgnyldz/rgnlabs-micro-wake-words/refs/heads/main/optimus/optimus.json
+    #   id: optimus
+    # - model: https://raw.githubusercontent.com/rgnyldz/r2d2/refs/heads/main/wakeword/r2d2.json
+    #   id: r2d2
+    # - model: https://raw.githubusercontent.com/rgnyldz/r2d2/refs/heads/main/wakeword/r2.json
+    #   id: r2
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
@@ -802,7 +831,7 @@ micro_wake_word:
               - script.execute:
                   id: play_sound
                   priority: true
-                  sound_file: !lambda return id(wake_word_triggered_sound);
+                  sound_file: "wake_word_triggered_sound"
               - delay: 300ms
         - voice_assistant.start:
             wake_word: !lambda return wake_word;
@@ -864,7 +893,7 @@ voice_assistant:
           - script.execute:
               id: play_sound
               priority: true
-              sound_file: !lambda return id(error_cloud_expired);
+              sound_file: "error_cloud_expired"
   on_start:
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
@@ -919,6 +948,7 @@ voice_assistant:
         decibel_reduction: 0
         duration: 1.0s
 
+    - delay: 200ms
     - script.execute: continue_conversation_restart
 
     - if:
@@ -927,6 +957,7 @@ voice_assistant:
         then:
           - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
           - script.execute: control_leds
+          - delay: 100ms
           - script.execute: sync_ceiling_to_main
 
 button:
